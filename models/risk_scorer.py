@@ -25,6 +25,17 @@ from scipy.stats import zscore
 log = logging.getLogger(__name__)
 
 
+def _finite(value, default: float = 0.0) -> float:
+    """Float conversion that turns missing and non-finite values into `default`."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not np.isfinite(number):
+        return default
+    return number
+
+
 class RiskLevel(IntEnum):
     NORMAL   = 0
     ELEVATED = 1
@@ -48,6 +59,7 @@ class SiteRisk:
     rain_stream_pressure: float
     anomaly_flags: List[str] = field(default_factory=list)
     confidence: float = 1.0
+    source: str = ""
 
 
 @dataclass
@@ -87,7 +99,7 @@ class FloodRiskScorer:
         pct_of_flood_stage       0.40  (how close to flood stage)
         discharge_zscore         0.25  (how anomalous vs. historical)
         rain_stream_pressure     0.20  (rain * flood proximity)
-        pct_of_action_stage      0.15  (NOAA action threshold proximity)
+        pct_of_action_stage      0.15  (configured action stage, 65% of flood stage)
 
     All components are clipped to [0, 1] before weighting.
     """
@@ -111,12 +123,13 @@ class FloodRiskScorer:
         """Compute risk score for a single gauge observation."""
         flags = []
 
-        # Normalise each component to [0, 1]
-        flood_pct    = float(np.clip(row.get("pct_of_flood_stage", 0), 0, 1))
-        action_pct   = float(np.clip(row.get("pct_of_action_stage", 0), 0, 1))
-        z_raw        = float(row.get("discharge_roll24h_zscore", 0) or 0)
+        # Normalise each component to [0, 1]. Non-finite inputs count as 0
+        # so a missing rolling z-score cannot turn the composite into NaN.
+        flood_pct    = float(np.clip(_finite(row.get("pct_of_flood_stage", 0)), 0, 1))
+        action_pct   = float(np.clip(_finite(row.get("pct_of_action_stage", 0)), 0, 1))
+        z_raw        = _finite(row.get("discharge_roll24h_zscore", 0))
         z_norm       = float(np.clip((z_raw + 3) / 6, 0, 1))   # map [-3,+3] → [0,1]
-        rain_press   = float(np.clip(row.get("rain_stream_pressure", 0) / 2.0, 0, 1))
+        rain_press   = float(np.clip(_finite(row.get("rain_stream_pressure", 0)) / 2.0, 0, 1))
 
         composite = (
             self.WEIGHTS["pct_of_flood_stage"]   * flood_pct +
@@ -154,8 +167,9 @@ class FloodRiskScorer:
             composite_score=round(composite, 4),
             pct_of_flood_stage=round(flood_pct, 4),
             discharge_zscore=round(z_raw, 4),
-            rain_stream_pressure=round(float(row.get("rain_stream_pressure", 0)), 4),
+            rain_stream_pressure=round(_finite(row.get("rain_stream_pressure", 0)), 4),
             anomaly_flags=flags,
+            source=str(row.get("source", "") or ""),
         )
 
     def score_basin(

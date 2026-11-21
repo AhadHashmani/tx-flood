@@ -9,10 +9,10 @@ Author: Ahad Hashmani
 """
 
 import os
-import sys
 import time
-from datetime import datetime, timezone
-from typing import List
+from typing import Optional
+
+import pandas as pd
 
 from models.risk_scorer import BasinRisk, RiskLevel, SiteRisk
 
@@ -91,8 +91,10 @@ def render_site_row(site: SiteRisk) -> str:
     z_str = f"z={site.discharge_zscore:+.1f}"
 
     flags = ""
+    if site.source == "synthetic":
+        flags = f"  {GRAY}synthetic fallback{RESET}"
     if site.anomaly_flags:
-        flags = f"  {GRAY}[{', '.join(site.anomaly_flags[:2])}]{RESET}"
+        flags += f"  {GRAY}[{', '.join(site.anomaly_flags[:2])}]{RESET}"
 
     return (
         f"  {WHITE}{name_trunc:<38}{RESET} "
@@ -104,22 +106,29 @@ def render_site_row(site: SiteRisk) -> str:
     )
 
 
-def render_footer() -> str:
+def render_footer(data_source: Optional[str] = None, live_hint: bool = False) -> str:
+    source_line = f"  {GRAY}Data: {data_source}{RESET}\n" if data_source else ""
+    hint = f"  {GRAY}Press Ctrl+C to exit{RESET}\n" if live_hint else ""
     return (
         f"{'─' * WIDTH}\n"
-        f"  {GRAY}Sources: USGS NWIS (stream gauges) · NOAA NWS (precipitation)\n"
-        f"  Flood stages: Lower Colorado River Authority / NOAA\n"
-        f"  Press Ctrl+C to exit{RESET}\n"
+        f"  {GRAY}Sources: USGS NWIS instantaneous values · NWS api.weather.gov precipitation\n"
+        f"  Flood-stage thresholds are configured constants, not a live flood-stage feed.{RESET}\n"
+        f"{source_line}"
+        f"{hint}"
         f"{'─' * WIDTH}\n"
     )
 
 
-def render_full_dashboard(basin: BasinRisk) -> str:
+def render_full_dashboard(
+    basin: BasinRisk,
+    data_source: Optional[str] = None,
+    live_hint: bool = False,
+) -> str:
     lines = [render_header(basin)]
     sites_sorted = sorted(basin.sites, key=lambda s: s.composite_score, reverse=True)
     for site in sites_sorted:
         lines.append(render_site_row(site))
-    lines.append(render_footer())
+    lines.append(render_footer(data_source=data_source, live_hint=live_hint))
     return "\n".join(lines)
 
 
@@ -139,10 +148,11 @@ def run_live_dashboard(
     refresh_seconds : seconds between data fetches
     max_cycles      : stop after N cycles (0 = run forever)
     """
-    # Import here to avoid circular at module level
+    # Import here to avoid a cycle with the entry point
     from ingestion.fetchers import (
+        describe_run_source,
         fetch_all_gauges,
-        fetch_noaa_precip,
+        fetch_nws_precip,
         generate_historical_baseline,
     )
     from pipeline.features import (
@@ -150,6 +160,7 @@ def run_live_dashboard(
         compute_rolling_stats,
         merge_precip_features,
         build_feature_matrix,
+        recent_history_per_site,
     )
     from models.risk_scorer import AnomalyDetector, FloodRiskScorer
 
@@ -166,12 +177,12 @@ def run_live_dashboard(
         while True:
             cycle += 1
             gauge_df = fetch_all_gauges()
-            precip   = fetch_noaa_precip()
+            precip   = fetch_nws_precip()
 
             feat_df = engineer_gauge_features(gauge_df)
 
             # Append to historical tail and recompute rolling stats
-            tail = historical.tail(168 * len(gauge_df)).copy()   # last week
+            tail = recent_history_per_site(historical, hours=168)
             combined = pd.concat([tail, feat_df], ignore_index=True)
             combined = compute_rolling_stats(combined)
             current = combined[combined["source"] != "synthetic_historical"].copy()
@@ -186,9 +197,10 @@ def run_live_dashboard(
             feature_matrix = build_feature_matrix(current)
 
             basin = scorer.score_basin(feature_matrix, precip_24h=precip.precip_24h_in)
+            data_source = describe_run_source(gauge_df["source"], precip.source)
 
             clear_screen()
-            print(render_full_dashboard(basin))
+            print(render_full_dashboard(basin, data_source=data_source, live_hint=True))
             print(detector.anomaly_report(current))
 
             if max_cycles and cycle >= max_cycles:
@@ -199,7 +211,3 @@ def run_live_dashboard(
 
     except KeyboardInterrupt:
         print(f"\n{CYAN}TxFlood exiting.{RESET}\n")
-
-
-# ── import guard for feature module ────────────────────────────────
-import pandas as pd  # noqa: E402  (needed for run_live_dashboard)

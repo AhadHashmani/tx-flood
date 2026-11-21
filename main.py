@@ -19,7 +19,8 @@ Author: Ahad Hashmani
 
 import argparse
 import logging
-import sys
+
+import pandas as pd
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,8 +33,9 @@ log = logging.getLogger("txflood")
 def run_snapshot() -> None:
     """Single-pass risk assessment printed to stdout."""
     from ingestion.fetchers import (
+        describe_run_source,
         fetch_all_gauges,
-        fetch_noaa_precip,
+        fetch_nws_precip,
         generate_historical_baseline,
     )
     from pipeline.features import (
@@ -41,6 +43,7 @@ def run_snapshot() -> None:
         compute_rolling_stats,
         merge_precip_features,
         build_feature_matrix,
+        recent_history_per_site,
     )
     from models.risk_scorer import AnomalyDetector, FloodRiskScorer
     from dashboard.display import render_full_dashboard
@@ -55,13 +58,13 @@ def run_snapshot() -> None:
 
     log.info("Fetching current gauge readings...")
     gauge_df = fetch_all_gauges()
-    precip   = fetch_noaa_precip()
+    precip   = fetch_nws_precip()
 
     log.info("Engineering features...")
     feat = engineer_gauge_features(gauge_df)
 
-    tail     = historical.tail(168 * len(gauge_df)).copy()
-    combined = __import__("pandas").concat([tail, feat], ignore_index=True)
+    tail     = recent_history_per_site(historical, hours=168)
+    combined = pd.concat([tail, feat], ignore_index=True)
     combined = compute_rolling_stats(combined)
     current  = combined[combined["source"] != "synthetic_historical"].copy()
 
@@ -72,10 +75,10 @@ def run_snapshot() -> None:
     features = build_feature_matrix(current)
 
     basin = scorer.score_basin(features, precip_24h=precip.precip_24h_in)
+    data_source = describe_run_source(gauge_df["source"], precip.source)
 
-    print(render_full_dashboard(basin))
+    print(render_full_dashboard(basin, data_source=data_source))
     print(detector.anomaly_report(current))
-    print(f"\nData source: {'LIVE (USGS/NOAA)' if 'live' in gauge_df['source'].values else 'SYNTHETIC (demo mode)'}")
 
 
 def main() -> None:
