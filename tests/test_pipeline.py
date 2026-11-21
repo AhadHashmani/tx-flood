@@ -16,10 +16,12 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import pandas as pd
 import pytest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from ingestion.fetchers import (
+    describe_run_source,
     generate_historical_baseline,
+    _precip_inches,
     _synthetic_gauge,
     _synthetic_precip,
     USGS_GAUGES,
@@ -29,6 +31,7 @@ from pipeline.features import (
     compute_rolling_stats,
     merge_precip_features,
     build_feature_matrix,
+    recent_history_per_site,
     FLOOD_STAGE_FT,
 )
 from models.risk_scorer import (
@@ -49,7 +52,7 @@ def sample_gauge_df():
         records.append({
             "site_name":      name,
             "site_id":        sid,
-            "timestamp":      datetime.utcnow() - timedelta(minutes=5 * i),
+            "timestamp":      datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5 * i),
             "discharge_cfs":  100.0 + i * 20,
             "gage_height_ft": 3.0 + i * 0.5,
             "source":         "test",
@@ -94,6 +97,53 @@ class TestIngestion:
         assert precip.precip_1h_in >= 0
         assert precip.precip_6h_in >= 0
         assert precip.precip_24h_in >= 0
+        assert precip.source == "synthetic"
+
+    def test_precip_inches_null_is_missing_not_zero(self):
+        assert _precip_inches(
+            {"precipitationLastHour": {"value": None, "unitCode": "wmoUnit:mm"}},
+            "precipitationLastHour",
+        ) is None
+        assert _precip_inches({"precipitationLast24Hours": None}, "precipitationLast24Hours") is None
+        assert _precip_inches(
+            {"precipitationLastHour": {"value": 25.4, "unitCode": "wmoUnit:mm"}},
+            "precipitationLastHour",
+        ) == 1.0
+
+    def test_site_ids_match_usgs_station_names(self):
+        by_id = {site_id: name for name, site_id in USGS_GAUGES.items()}
+        assert by_id == {
+            "08155200": "Barton_Ck_at_SH71_nr_Oak_Hill",
+            "08158000": "Colorado_Rv_at_Austin",
+            "08156800": "Shoal_Ck_at_W_12th_St",
+            "08156650": "Shoal_Ck_at_Steck_Ave",
+            "08157000": "Waller_Ck_at_38th_St",
+            "08159150": "Wilbarger_Ck_nr_Pflugerville",
+        }
+
+    def test_flood_stage_keys_match_gauges(self):
+        assert set(FLOOD_STAGE_FT) == set(USGS_GAUGES)
+
+    def test_describe_run_source_live_still_marks_synthetic_baseline(self):
+        label = describe_run_source(["usgs_live", "usgs_live"], "nws_live")
+        assert label.startswith("LIVE readings")
+        assert "180-day anomaly baseline is synthetic" in label
+
+    def test_describe_run_source_does_not_treat_usgs_live_as_demo(self):
+        # Membership on the exact string "live" used to miss "usgs_live".
+        label = describe_run_source(["usgs_live"], "nws_live")
+        assert not label.startswith("SYNTHETIC")
+
+    def test_describe_run_source_incomplete_precip(self):
+        label = describe_run_source(["usgs_live"], "nws_live_precip_incomplete")
+        assert "missing" in label
+        assert "0.0 in" in label
+
+    def test_describe_run_source_mixed_and_demo(self):
+        mixed = describe_run_source(["usgs_live", "synthetic"], "nws_live")
+        demo = describe_run_source(["synthetic", "synthetic"], "synthetic")
+        assert mixed.startswith("MIXED")
+        assert demo.startswith("SYNTHETIC")
 
 
 # ── Feature engineering tests ────────────────────────────────────────
@@ -129,6 +179,32 @@ class TestFeatureEngineering:
         result = build_feature_matrix(eng)
         assert len(result) == len(sample_gauge_df)
 
+    def test_recent_history_keeps_every_site(self):
+        rows = []
+        start = datetime(2026, 1, 1, tzinfo=timezone.utc).replace(tzinfo=None)
+        for site, count in (("A", 10), ("B", 10)):
+            for i in range(count):
+                rows.append({
+                    "site_name": site,
+                    "timestamp": start + timedelta(hours=i),
+                    "discharge_cfs": float(i),
+                })
+        out = recent_history_per_site(pd.DataFrame(rows), hours=3)
+        assert set(out["site_name"]) == {"A", "B"}
+        assert out.groupby("site_name").size().tolist() == [3, 3]
+        assert out.loc[out["site_name"] == "A", "discharge_cfs"].tolist() == [7.0, 8.0, 9.0]
+
+    def test_each_site_gets_a_finite_rolling_zscore(self, historical_df):
+        engineered = engineer_gauge_features(historical_df)
+        current = engineered.groupby("site_name", group_keys=False).tail(1).copy()
+        current["source"] = "test"
+        history = recent_history_per_site(engineered, hours=168)
+        combined = pd.concat([history, current], ignore_index=True)
+        rolled = compute_rolling_stats(combined)
+        latest = rolled[rolled["source"] == "test"]
+        assert len(latest) == len(USGS_GAUGES)
+        assert latest["discharge_roll24h_zscore"].notna().all()
+
 
 # ── Anomaly detector tests ───────────────────────────────────────────
 class TestAnomalyDetector:
@@ -163,6 +239,19 @@ class TestAnomalyDetector:
 
 # ── Risk scorer tests ────────────────────────────────────────────────
 class TestRiskScorer:
+    def test_non_finite_zscore_does_not_make_score_nan(self, scorer):
+        row = pd.Series({
+            "site_name":                list(USGS_GAUGES.keys())[0],
+            "pct_of_flood_stage":       0.20,
+            "pct_of_action_stage":      0.30,
+            "discharge_roll24h_zscore": float("nan"),
+            "rain_stream_pressure":     0.01,
+            "precip_24h_in":            0.1,
+        })
+        result = scorer.score_site(row)
+        assert result.composite_score == result.composite_score
+        assert result.risk_level == RiskLevel.NORMAL
+
     def test_normal_conditions_score_low(self, scorer):
         row = pd.Series({
             "site_name":                  list(USGS_GAUGES.keys())[0],
@@ -228,3 +317,56 @@ class TestRiskLevel:
     def test_color_codes(self):
         assert RiskLevel.CRITICAL.color_code() == "red"
         assert RiskLevel.NORMAL.color_code() == "green"
+
+
+def _live_gauge_frame() -> pd.DataFrame:
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    return pd.DataFrame([
+        {
+            "site_name": name,
+            "site_id": site_id,
+            "timestamp": now,
+            "discharge_cfs": 50.0,
+            "gage_height_ft": 2.0,
+            "source": "usgs_live",
+        }
+        for name, site_id in USGS_GAUGES.items()
+    ])
+
+
+def _measured_precip():
+    from ingestion.fetchers import PrecipReading
+    return PrecipReading(
+        station="TEST",
+        timestamp=datetime.now(timezone.utc).replace(tzinfo=None),
+        precip_1h_in=0.0,
+        precip_6h_in=0.0,
+        precip_24h_in=0.1,
+        source="nws_live",
+    )
+
+
+class TestEntryPoint:
+    def test_snapshot_scores_every_gauge(self, capsys, monkeypatch):
+        from main import run_snapshot
+
+        monkeypatch.setattr("ingestion.fetchers.fetch_all_gauges", _live_gauge_frame)
+        monkeypatch.setattr("ingestion.fetchers.fetch_nws_precip", _measured_precip)
+        run_snapshot()
+        out = capsys.readouterr().out
+        assert "TxFlood" in out
+        assert "score=nan" not in out
+        assert "LIVE readings (USGS gauges, NWS precipitation)" in out
+        for name in USGS_GAUGES:
+            assert name.replace("_", " ") in out
+
+    def test_live_dashboard_stops_after_one_cycle(self, capsys, monkeypatch):
+        from dashboard.display import run_live_dashboard
+
+        monkeypatch.setattr("ingestion.fetchers.fetch_all_gauges", _live_gauge_frame)
+        monkeypatch.setattr("ingestion.fetchers.fetch_nws_precip", _measured_precip)
+        run_live_dashboard(refresh_seconds=1, max_cycles=1)
+        out = capsys.readouterr().out
+        assert "TxFlood" in out
+        assert "score=nan" not in out
+        assert "Press Ctrl+C to exit" in out

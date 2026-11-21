@@ -10,21 +10,22 @@ Author: Ahad Hashmani
 """
 
 import logging
-from typing import Optional
 
 import numpy as np
 import pandas as pd
 
 log = logging.getLogger(__name__)
 
-# Flash flood warning thresholds (NOAA / Lower Colorado River Authority)
+# Configured stage constants, keyed like USGS_GAUGES. They are not fetched
+# from NWS or LCRA. Each value stayed with its site number when station
+# names were corrected. Action stage is 65% of the configured flood stage.
 FLOOD_STAGE_FT: dict = {
-    "Barton_Creek_at_SH71":             13.0,
-    "Colorado_River_at_Austin":         28.0,
-    "Shoal_Creek_at_12th_St":            9.0,
-    "Bull_Creek_at_Loop_360":            8.5,
-    "Waller_Creek_at_23rd_St":           7.0,
-    "Williamson_Creek_at_Slaughter":    10.0,
+    "Barton_Ck_at_SH71_nr_Oak_Hill": 13.0,
+    "Colorado_Rv_at_Austin": 28.0,
+    "Shoal_Ck_at_W_12th_St": 9.0,
+    "Shoal_Ck_at_Steck_Ave": 8.5,
+    "Waller_Ck_at_38th_St": 7.0,
+    "Wilbarger_Ck_nr_Pflugerville": 10.0,
 }
 
 ACTION_STAGE_FT: dict = {k: v * 0.65 for k, v in FLOOD_STAGE_FT.items()}
@@ -63,6 +64,16 @@ def engineer_gauge_features(df: pd.DataFrame) -> pd.DataFrame:
     ).round(4)
 
     return df
+
+
+def recent_history_per_site(df: pd.DataFrame, hours: int = 168) -> pd.DataFrame:
+    """Return the last `hours` rows of each site.
+
+    The historical frame is stacked site-by-site, so DataFrame.tail on the
+    whole frame keeps only the last site.
+    """
+    ordered = df.sort_values(["site_name", "timestamp"])
+    return ordered.groupby("site_name", group_keys=False).tail(hours)
 
 
 def compute_rolling_stats(
@@ -139,12 +150,13 @@ def build_feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
         "discharge_roll24h_zscore",
         "discharge_roll168h_zscore",
         "is_nighttime",
+        "source",
     ]
     available = [c for c in feature_cols if c in df.columns]
     missing = set(feature_cols) - set(available)
     if missing:
-        log.warning("Missing feature columns (will be filled with 0): %s", missing)
+        log.warning("Missing feature columns (filled with defaults): %s", missing)
         for col in missing:
-            df[col] = 0.0
+            df[col] = "" if col == "source" else 0.0
 
     return df[feature_cols].reset_index(drop=True)
